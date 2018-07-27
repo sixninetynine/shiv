@@ -9,7 +9,7 @@ from zipapp import ZipAppError
 
 import pytest
 
-from shiv.builder import write_file_prefix, create_archive
+from shiv.zipapp import write_file_prefix, create_archive
 
 
 UGOX = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH

@@ -19,3 +19,6 @@ BLACKLISTED_ARGS: Dict[Tuple[str, ...], str] = {
     ("--user", "--root", "--prefix"): "Which conflicts with Shiv's internal use of '--target'.",
 }
 DISTUTILS_CFG_NO_PREFIX = "[install]\nprefix="
+
+# misc
+SHIV = u"\U0001F52A"  # This is the 'knife' emoji

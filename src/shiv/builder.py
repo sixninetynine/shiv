@@ -1,98 +1,84 @@
-"""
-This module is a slightly modified implementation of Python's "zipapp" module.
-
-We've copied a lot of zipapp's code here in order to backport support for compression.
-https://docs.python.org/3.7/library/zipapp.html#cmdoption-zipapp-c
-
-"""
-import contextlib
-import zipfile
-import stat
+import importlib_resources  # type: ignore
+import shutil
 import sys
-import zipapp
+import uuid
 
+from configparser import ConfigParser
 from pathlib import Path
-from typing import Any, IO, Generator, Union
+from tempfile import TemporaryDirectory
 
-from .constants import BINPRM_ERROR
-
-# Typical maximum length for a shebang line
-BINPRM_BUF_SIZE = 128
-
-# zipapp __main__.py template
-MAIN_TEMPLATE = """\
-# -*- coding: utf-8 -*-
-import {module}
-{module}.{fn}()
-"""
+from . import pip, bootstrap, zipapp
+from .constants import NO_ENTRY_POINT
+from .bootstrap.environment import Environment
 
 
-def write_file_prefix(f: IO[Any], interpreter: str) -> None:
-    """Write a shebang line.
+class UserError(Exception):
+    """An exception to wrap errors related to user input."""
 
-    :param f: An open file handle.
-    :param interpreter: A path to a python interpreter.
+
+def find_entry_point(site_packages: Path, console_script: str) -> str:
+    """Find a console_script in a site-packages directory.
+
+    Console script metadata is stored in entry_points.txt per setuptools
+    convention. This function searches all entry_points.txt files and
+    returns the import string for a given console_script argument.
+
+    :param site_packages: A path to a site-packages directory on disk.
+    :param console_script: A console_script string.
     """
-    # if the provided path is too long for a shebang we should error out
-    if len(interpreter) > BINPRM_BUF_SIZE:
-        sys.exit(BINPRM_ERROR)
-
-    f.write(b"#!" + interpreter.encode(sys.getfilesystemencoding()) + b"\n")
+    config_parser = ConfigParser()
+    config_parser.read(site_packages.rglob("entry_points.txt"))
+    return config_parser["console_scripts"][console_script]
 
 
-@contextlib.contextmanager
-def maybe_open(archive: Union[str, Path], mode: str) -> Generator[IO[Any], None, None]:
-    if isinstance(archive, (str, Path)):
-        with Path(archive).open(mode=mode) as f:
-            yield f
+def copy_bootstrap(bootstrap_target: Path) -> None:
+    """Copy bootstrap code from shiv into the pyz.
 
-    else:
-        yield archive
-
-
-def create_archive(
-    source: Path,
-    target: Path,
-    interpreter: str,
-    main: str,
-    compressed: bool = True
-) -> None:
-    """Create an application archive from SOURCE.
-
-    A slightly modified version of stdlib's
-    `zipapp.create_archive <https://docs.python.org/3/library/zipapp.html#zipapp.create_archive>`_
-
+    :param bootstrap_target: The temporary directory where we are staging pyz contents.
     """
-    # Check that main has the right format.
-    mod, sep, fn = main.partition(":")
-    mod_ok = all(part.isidentifier() for part in mod.split("."))
-    fn_ok = all(part.isidentifier() for part in fn.split("."))
-    if not (sep == ":" and mod_ok and fn_ok):
-        raise zipapp.ZipAppError("Invalid entry point: " + main)
+    for bootstrap_file in importlib_resources.contents(bootstrap):
+        if importlib_resources.is_resource(bootstrap, bootstrap_file):
+            with importlib_resources.path(bootstrap, bootstrap_file) as f:
+                shutil.copyfile(f.absolute(), bootstrap_target / f.name)
 
-    main_py = MAIN_TEMPLATE.format(module=mod, fn=fn)
 
-    with maybe_open(target, "wb") as fd:
-        # write shebang
-        write_file_prefix(fd, interpreter)
+def build(output_file, pip_args, compressed=True, python=None, entry_point=None, console_script=None):
+    with TemporaryDirectory() as working_path:
+        site_packages = Path(working_path, "site-packages")
+        site_packages.mkdir(parents=True, exist_ok=True)
 
-        # determine compression
-        compression = zipfile.ZIP_DEFLATED if compressed else zipfile.ZIP_STORED
+        # install deps into staged site-packages
+        pip.install(
+            ["--target", str(site_packages)] + list(pip_args),
+        )
 
-        # create zipapp
-        with zipfile.ZipFile(fd, "w", compression=compression) as z:
-            for child in source.rglob("*"):
+        # if entry_point is a console script, get the callable
+        if entry_point is None and console_script is not None:
+            try:
+                entry_point = find_entry_point(site_packages, console_script)
+            except KeyError:
+                raise UserError(NO_ENTRY_POINT.format(entry_point=console_script))
 
-                # skip compiled files
-                if child.suffix == '.pyc':
-                    continue
+        # create runtime environment metadata
+        env = Environment(
+            build_id=str(uuid.uuid4()),
+            entry_point=entry_point,
+        )
 
-                arcname = child.relative_to(source)
-                z.write(str(child), str(arcname))
+        Path(working_path, "environment.json").write_text(env.to_json())
 
-            # write main
-            z.writestr("__main__.py", main_py.encode("utf-8"))
+        # create bootstrapping directory in working path
+        bootstrap_target = Path(working_path, "_bootstrap")
+        bootstrap_target.mkdir(parents=True, exist_ok=True)
 
-    # make executable
-    # NOTE on windows this is no-op
-    target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        # copy bootstrap code
+        copy_bootstrap(bootstrap_target)
+
+        # create the zip
+        zipapp.create_archive(
+            Path(working_path),
+            target=Path(output_file),
+            interpreter=python or sys.executable,
+            main="_bootstrap:bootstrap",
+            compressed=compressed,
+        )
